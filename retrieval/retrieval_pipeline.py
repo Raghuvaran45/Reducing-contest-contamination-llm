@@ -12,7 +12,8 @@ import numpy as np
 
 from sentence_transformers import SentenceTransformer
 from google import genai
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # ============================================================
 # CONFIGURATION
