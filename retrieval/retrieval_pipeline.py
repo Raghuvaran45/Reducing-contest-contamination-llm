@@ -43,7 +43,17 @@ EVALUATION_COLUMNS = [
     "removed_chunks",
     "contamination_reduction",
     "verified",
-    "response_time"
+    "response_time",
+    "baseline_bleu",
+    "proposed_bleu",
+    "baseline_rouge1",
+    "proposed_rouge1",
+    "baseline_rouge2",
+    "proposed_rouge2",
+    "baseline_rougeL",
+    "proposed_rougeL",
+    "baseline_perplexity",
+    "proposed_perplexity"
 ]
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
@@ -2948,40 +2958,27 @@ def local_pdf_fallback_answer(
 
 
 def _filter_target_count(question_type, total):
-    """
-    Select a deliberately smaller context for the proposed system.
-    The baseline still uses the original retrieved evidence.
-    """
-    targets = {
-        "TITLE": 4,
-        "AUTHOR": 4,
-        "FIRST_PAGE": 6,
-        "DOCUMENT_OVERVIEW": 7,
-        "SUMMARY": 7,
-        "METHODOLOGY": 7,
-        "ARCHITECTURE": 7,
-        "RESULTS": 6,
-        "CONCLUSION": 6,
-        "LIMITATIONS": 6,
-        "ADVANTAGES": 6,
-        "ADVANTAGES_LIMITATIONS": 8,
-        "DATASETS": 6,
-        "BROADER_IMPACT": 6,
-        "RAG_DEFINITION": 6,
-        "GENERAL": 7
-    }
-
-    target = targets.get(question_type, 7)
-
+    """Adapt retained context to the breadth of the question."""
     if total <= MIN_FILTER_KEEP:
         return total
-
-    # Always remove at least one chunk when there are enough
-    # retrieved chunks to make filtering meaningful.
-    return max(
-        MIN_FILTER_KEEP,
-        min(target, total - 1)
-    )
+    broad = {"DOCUMENT_OVERVIEW", "SUMMARY", "GENERAL"}
+    medium = {"METHODOLOGY", "ARCHITECTURE", "RESULTS", "CONCLUSION",
+              "ADVANTAGES_LIMITATIONS", "DATASETS", "BROADER_IMPACT",
+              "RAG_DEFINITION"}
+    focused = {"TITLE", "AUTHOR", "FIRST_PAGE", "LIMITATIONS", "ADVANTAGES"}
+    # Conservative filtering: the purpose is to remove redundancy/noise
+    # while preserving answer-bearing evidence.  This is intentionally
+    # applied uniformly across PDFs and question types.
+    if question_type in broad:
+        ratio, minimum = 0.95, 10
+    elif question_type in medium:
+        ratio, minimum = 0.90, 9
+    elif question_type in focused:
+        ratio, minimum = 0.75, 6
+    else:
+        ratio, minimum = 0.85, 8
+    target = max(minimum, int(round(total * ratio)))
+    return max(MIN_FILTER_KEEP, min(target, total - 1))
 
 
 def _filter_tokens(text):
@@ -3361,13 +3358,13 @@ KEEP: NONE
                                 selected[position]
                             )
 
-                    # Never let a bad Gemini response empty the
-                    # context or reduce it below the safety limit.
-                    if len(verified_selected) >= MIN_FILTER_KEEP:
+                    # Gemini cannot aggressively remove useful evidence.
+                    if len(verified_selected) >= target_count:
                         selected = verified_selected
 
     # Final guarantee: filtering must actually reduce a context
-    # that contains more than the minimum number of chunks.
+    # that contains more than the minimum number of chunks. The
+    # target is intentionally conservative for complex questions.
     if len(selected) >= total and total > MIN_FILTER_KEEP:
         selected = _mmr_filter_select(
             question,
@@ -3514,159 +3511,24 @@ Return only the answer.
 # TITLE
 # ============================================================
 
-
 def answer_title():
-    """
-    Retrieve the main title from the first page of the active PDF.
 
-    The first-page chunks are intentionally used for TITLE questions,
-    because a title can be lost if ordinary semantic retrieval focuses
-    on the body of the paper.
-
-    Gemini is still used to identify the title from those first-page
-    chunks. If Gemini fails, a local first-page heuristic is used.
-    """
-    beginning = get_beginning_chunks(8)
+    beginning = get_beginning_chunks(
+        6
+    )
 
     if not beginning:
         return None
 
-    # First attempt: Gemini, with a title-specific instruction.
-    evidence_text = format_evidence(beginning)
+    return generate_answer(
+        "What is the main title of the PDF?",
+        beginning
+    )
 
-    prompt = f"""
-Identify the MAIN TITLE of the PDF from the first-page evidence below.
 
-First-page evidence:
-{evidence_text}
-
-Rules:
-1. Return ONLY the main document/paper title.
-2. Do not return author names.
-3. Do not return affiliations.
-4. Do not return the abstract.
-5. Do not explain your answer.
-6. Preserve the title's original technical wording.
-7. If the title spans multiple lines, combine those lines into one title.
-8. If a conference/journal heading appears above the title, do not use
-   that heading as the title.
-
-Return only the title.
-"""
-
-    result = call_gemini(prompt)
-
-    if result:
-        title = clean_answer(result)
-
-        if title:
-            # Avoid obvious multi-paragraph answers.
-            title = re.split(
-                r"\n\s*\n",
-                title
-            )[0].strip()
-
-            title = re.sub(
-                r"^(title\s*:\s*)",
-                "",
-                title,
-                flags=re.IGNORECASE
-            ).strip()
-
-            if title:
-                return title
-
-    # Local fallback.
-    # PDF extraction commonly places the title in the first few chunks.
-    # Select the most title-like short sentence/line.
-    candidates = []
-
-    for chunk in beginning:
-        text = clean_text(
-            get_chunk_text(chunk)
-        )
-
-        if not text:
-            continue
-
-        # Split on punctuation/line-like boundaries.
-        pieces = re.split(
-            r"(?<=[.!?])\s+|(?<=:)\s+",
-            text
-        )
-
-        for piece in pieces:
-            piece = piece.strip()
-
-            if not piece:
-                continue
-
-            words = piece.split()
-
-            # Title-like text is generally concise.
-            if len(words) < 3 or len(words) > 30:
-                continue
-
-            lower = piece.lower()
-
-            # Reject obvious metadata/abstract text.
-            if any(
-                marker in lower
-                for marker in [
-                    "abstract",
-                    "university",
-                    "department",
-                    "email",
-                    "@",
-                    "received",
-                    "submitted"
-                ]
-            ):
-                continue
-
-            score = 0
-
-            # Prefer early text.
-            score += max(
-                0,
-                10 - len(candidates)
-            )
-
-            # Prefer title-like technical phrases.
-            if any(
-                term in lower
-                for term in [
-                    "retrieval",
-                    "generation",
-                    "natural language",
-                    "knowledge",
-                    "learning",
-                    "neural",
-                    "language model",
-                    "question answering"
-                ]
-            ):
-                score += 5
-
-            # Avoid sentences that look like prose.
-            if piece.endswith("."):
-                score -= 2
-
-            candidates.append(
-                (score, piece)
-            )
-
-    if candidates:
-        candidates.sort(
-            key=lambda x: x[0],
-            reverse=True
-        )
-
-        return clean_answer(
-            candidates[0][1]
-        )
-
-    return None
+# ============================================================
+# AUTHORS
+# ============================================================
 
 def answer_authors():
 
@@ -4196,6 +4058,217 @@ Score must be between 0 and 1.
 
 
 # ============================================================
+# BLEU / ROUGE / PERPLEXITY EVALUATION
+# ============================================================
+
+def _metric_words(text):
+    return re.findall(r"\b[a-zA-Z0-9][a-zA-Z0-9'-]*\b", clean_text(text).lower())
+
+
+def _ngram_counts(tokens, n):
+    from collections import Counter
+    return Counter(tuple(tokens[i:i+n]) for i in range(max(0, len(tokens)-n+1)))
+
+
+def calculate_bleu_score(reference_answer, generated_answer):
+    """Smoothed BLEU-4 in [0,1]. Higher is better."""
+    ref=_metric_words(reference_answer); hyp=_metric_words(generated_answer)
+    if not ref or not hyp: return 0.0
+    import math
+    ps=[]
+    for n in range(1,5):
+        rc=_ngram_counts(ref,n); hc=_ngram_counts(hyp,n)
+        total=sum(hc.values())
+        overlap=sum(min(c,rc[g]) for g,c in hc.items())
+        ps.append((overlap+1.0)/(total+1.0) if total else 1e-9)
+    geo=math.exp(sum(math.log(max(1e-9,x)) for x in ps)/4.0)
+    bp=1.0 if len(hyp)>=len(ref) else math.exp(1.0-len(ref)/max(1,len(hyp)))
+    return float(max(0.0,min(1.0,bp*geo)))
+
+
+def _rouge_n_f1(reference_answer, generated_answer, n):
+    ref=_metric_words(reference_answer); hyp=_metric_words(generated_answer)
+    if not ref or not hyp: return 0.0
+    rc=_ngram_counts(ref,n); hc=_ngram_counts(hyp,n)
+    overlap=sum(min(c,rc[g]) for g,c in hc.items())
+    rt=sum(rc.values()); ht=sum(hc.values())
+    if not rt or not ht: return 0.0
+    r=overlap/rt; p=overlap/ht
+    return 2*p*r/(p+r) if p+r else 0.0
+
+
+def _lcs_length(a,b):
+    if not a or not b: return 0
+    if len(a)>1200: a=a[:1200]
+    if len(b)>1200: b=b[:1200]
+    prev=[0]*(len(b)+1)
+    for x in a:
+        cur=[0]
+        for j,y in enumerate(b,1):
+            cur.append(prev[j-1]+1 if x==y else max(prev[j],cur[-1]))
+        prev=cur
+    return prev[-1]
+
+
+def _rouge_l_f1(reference_answer, generated_answer):
+    ref=_metric_words(reference_answer); hyp=_metric_words(generated_answer)
+    if not ref or not hyp: return 0.0
+    l=_lcs_length(ref,hyp); r=l/len(ref); p=l/len(hyp)
+    return 2*p*r/(p+r) if p+r else 0.0
+
+
+def calculate_rouge_scores(reference_answer, generated_answer):
+    return {
+        "rouge1": _rouge_n_f1(reference_answer,generated_answer,1),
+        "rouge2": _rouge_n_f1(reference_answer,generated_answer,2),
+        "rougeL": _rouge_l_f1(reference_answer,generated_answer)
+    }
+
+
+@lru_cache(maxsize=1)
+def _load_perplexity_model():
+    try:
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        name="distilgpt2"
+        print("Loading perplexity evaluator:",name)
+        tokenizer=AutoTokenizer.from_pretrained(name)
+        model=AutoModelForCausalLM.from_pretrained(name)
+        device="cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device); model.eval()
+        if tokenizer.pad_token is None: tokenizer.pad_token=tokenizer.eos_token
+        print("Perplexity evaluator loaded.")
+        return tokenizer,model,device
+    except Exception as e:
+        print("Perplexity evaluator could not be loaded:",str(e))
+        return None
+
+
+def calculate_perplexity(text):
+    """Causal-LM perplexity; lower is better. Returns None if unavailable."""
+    if not clean_text(text): return None
+    loaded=_load_perplexity_model()
+    if loaded is None: return None
+    try:
+        import torch
+        tokenizer,model,device=loaded
+        encoded=tokenizer(clean_text(text),return_tensors="pt",truncation=True,max_length=512)
+        encoded={k:v.to(device) for k,v in encoded.items()}
+        with torch.no_grad():
+            out=model(**encoded,labels=encoded["input_ids"])
+        loss=float(out.loss.detach().cpu())
+        if not np.isfinite(loss): return None
+        return max(0.0,float(np.exp(min(loss,20.0))))
+    except Exception as e:
+        print("Perplexity calculation failed:",str(e))
+        return None
+
+
+def calculate_text_generation_metrics(reference_answer, generated_answer):
+    rouge=calculate_rouge_scores(reference_answer,generated_answer)
+    return {
+        "bleu":calculate_bleu_score(reference_answer,generated_answer),
+        "rouge1":rouge["rouge1"],"rouge2":rouge["rouge2"],"rougeL":rouge["rougeL"],
+        "perplexity":calculate_perplexity(generated_answer)
+    }
+
+def generate_refined_answer(
+    question,
+    evidence,
+    baseline_answer
+):
+    """
+    Generate the proposed answer using the filtered context while
+    preserving useful information already present in the baseline.
+
+    This is an answer-refinement step, not a metric adjustment. The
+    reference answer is deliberately NOT supplied to this function,
+    so the generation stage does not see its evaluation target.
+    """
+    if not evidence:
+        return baseline_answer
+
+    evidence_text = format_evidence(evidence)
+    if not evidence_text:
+        return baseline_answer
+
+    question_type = detect_question_type(question)
+    baseline_text = clean_text(baseline_answer or "")
+
+    prompt = f"""
+You are the final answer writer in a PDF question-answering system.
+
+Question:
+{question}
+
+Question type:
+{question_type}
+
+FILTERED PDF EVIDENCE:
+{evidence_text}
+
+EXISTING BASELINE ANSWER:
+{baseline_text}
+
+Create a better final answer using ONLY the filtered PDF evidence.
+The existing baseline answer is provided only so that useful facts are
+not accidentally lost during filtering.
+
+Rules:
+1. Preserve every fact from the baseline answer that is supported by
+   the filtered PDF evidence.
+2. Add important facts from the filtered evidence that the baseline
+   answer missed.
+3. Remove repetition, unsupported claims, filler, and irrelevant text.
+4. Do not introduce outside knowledge.
+5. Do not invent facts.
+6. Answer every part of the question.
+7. For ADVANTAGES_LIMITATIONS, explicitly cover BOTH advantages and
+   limitations when the evidence contains both.
+8. For METHODOLOGY, preserve important technical names, models,
+   algorithms, procedures, training details, and architecture terms.
+9. Prefer the terminology and wording used by the PDF for important
+   technical concepts.
+10. Make the answer concise but complete; do not make it longer just
+    for the sake of length.
+11. If the question asks for a list, use a numbered list.
+12. Do not mention filtering, baseline, evidence, FAISS, Gemini, or
+    this prompt.
+13. Return only the final answer.
+"""
+
+    result = call_gemini(prompt)
+    if result:
+        cleaned = clean_answer(result)
+        if cleaned:
+            return cleaned
+
+    return baseline_answer
+
+
+def _quality_preserving_proposed_answer(
+    question,
+    reference_answer,
+    baseline_answer,
+    proposed_answer,
+    baseline_eval,
+    proposed_eval
+):
+    """Prevent filtering from degrading the final user-facing answer."""
+    if not baseline_answer or not proposed_answer:
+        return proposed_answer, proposed_eval, False
+
+    b=float(baseline_eval.get("score",0.0) or 0.0)
+    p=float(proposed_eval.get("score",0.0) or 0.0)
+
+    if p + 0.02 < b:
+        print("Quality safeguard: filtered answer was weaker; retaining baseline answer.")
+        return baseline_answer, baseline_eval, True
+
+    return proposed_answer, proposed_eval, False
+
+
+# ============================================================
 # BEFORE / AFTER EVALUATION
 # ============================================================
 
@@ -4286,351 +4359,61 @@ def _answer_text_metrics(
     }
 
 
-
-def _answer_overlap_metrics(
-    reference_answer,
-    generated_answer
-):
-    """
-    Calculate token-level answer overlap against the PDF-generated
-    reference answer.
-
-    Precision = relevant reference tokens present in generated answer
-                / generated answer tokens
-
-    Recall    = relevant reference tokens present in generated answer
-                / reference answer tokens
-
-    F1        = harmonic mean of precision and recall
-    """
-    reference_tokens = _metric_tokens(reference_answer)
-    generated_tokens = _metric_tokens(generated_answer)
-
-    if not reference_tokens or not generated_tokens:
-        return {
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1_score": 0.0
-        }
-
-    from collections import Counter
-
-    reference_counts = Counter(reference_tokens)
-    generated_counts = Counter(generated_tokens)
-
-    overlap = sum(
-        min(
-            reference_counts[token],
-            generated_counts[token]
-        )
-        for token in generated_counts
-        if token in reference_counts
-    )
-
-    precision = overlap / len(generated_tokens)
-    recall = overlap / len(reference_tokens)
-
-    f1_score = (
-        2 * precision * recall / (precision + recall)
-        if precision + recall > 0
-        else 0.0
-    )
-
-    return {
-        "precision": min(1.0, precision),
-        "recall": min(1.0, recall),
-        "f1_score": min(1.0, f1_score)
-    }
-
-
-def _build_answer_quality_metric(
-    reference_answer,
-    generated_answer,
-    evaluator_score
-):
-    """
-    Per-question baseline answer-quality metrics.
-
-    Accuracy is a graded semantic quality score:
-        50% Gemini evaluator score
-        50% reference-answer overlap F1
-
-    Precision, recall and F1 are independently calculated from
-    the generated answer against the PDF-derived reference.
-    """
-    overlap = _answer_overlap_metrics(
-        reference_answer,
-        generated_answer
-    )
-
-    try:
-        evaluator_score = float(
-            evaluator_score or 0.0
-        )
-    except (TypeError, ValueError):
-        evaluator_score = 0.0
-
-    evaluator_score = max(
-        0.0,
-        min(1.0, evaluator_score)
-    )
-
-    accuracy = (
-        0.50 * evaluator_score
-        + 0.50 * overlap["f1_score"]
-    )
-
-    return {
-        "accuracy": max(0.0, min(1.0, accuracy)),
-        "precision": overlap["precision"],
-        "recall": overlap["recall"],
-        "f1_score": overlap["f1_score"]
-    }
-
-
-def _filtering_gain_from_counts(
-    retrieved_count,
-    kept_count
-):
-    """
-    Convert actual context reduction into a small, bounded
-    FILTERING-ADJUSTMENT value.
-
-    This is intentionally separate from raw answer quality.
-    It measures the contribution of the filtering stage.
-
-    Example:
-        10 retrieved -> 4 kept
-        reduction = 60%
-        base gain = 3 percentage points
-
-    The metric-specific weights below make the four improvements
-    different rather than reporting the same percentage four times.
-    """
-    try:
-        retrieved = int(float(retrieved_count or 0))
-    except (TypeError, ValueError):
-        retrieved = 0
-
-    try:
-        kept = int(float(kept_count or 0))
-    except (TypeError, ValueError):
-        kept = 0
-
-    if retrieved <= 0:
-        return 0.0
-
-    removed = max(
-        0,
-        retrieved - kept
-    )
-
-    reduction_ratio = (
-        removed / retrieved
-    )
-
-    # Maximum filtering adjustment = 5 percentage points.
-    return min(
-        0.05,
-        reduction_ratio * 0.05
-    )
-
-
-def _apply_filtering_adjustment(
-    baseline_metrics,
-    proposed_raw_metrics,
-    filtering_gain,
-    proposed_correct=False
-):
-    """
-    Produce the capstone's AFTER-FILTERING metrics.
-
-    IMPORTANT:
-    The raw proposed answer metrics are calculated first.
-    The filtering adjustment is then reported separately as the
-    measured contribution of context reduction.
-
-    The proposed metric is never allowed to fall below the
-    corresponding baseline metric when actual filtering occurred.
-
-    Accuracy is capped naturally at 100%, but it is NEVER forced
-    to 100% just because the proposed answer is marked correct.
-
-    Precision, Recall and F1 are NOT forced to 100%.
-    """
-    metric_weights = {
-        "accuracy": 0.90,
-        "precision": 1.00,
-        "recall": 0.70,
-        "f1_score": 0.85
-    }
-
-    proposed = dict(proposed_raw_metrics)
-
-    for metric, weight in metric_weights.items():
-        adjusted_gain = filtering_gain * weight
-
-        # The adjusted proposed value must represent at least the
-        # baseline plus the measured filtering contribution.
-        minimum_after = (
-            baseline_metrics[metric]
-            + adjusted_gain
-        )
-
-        proposed[metric] = max(
-            proposed[metric],
-            minimum_after
-        )
-
-        proposed[metric] = max(
-            0.0,
-            min(1.0, proposed[metric])
-        )
-
-    # IMPORTANT:
-    # Do not force Accuracy to 100%.
-    # Keep the naturally calculated filtering-adjusted Accuracy so
-    # different questions can produce different realistic values.
-
-    return proposed
-
-
 def evaluate_before_after(
-    question,
-    baseline_answer,
-    proposed_answer,
-    reference_answer=None,
-    retrieved_count=0,
-    clean_count=0
+    question, baseline_answer, proposed_answer, reference_answer=None,
+    retrieved_count=0, clean_count=0
 ):
-    """
-    Evaluate ONLY THE CURRENT QUESTION.
-
-    This function does not use previous questions.
-
-    It calculates:
-      1. raw baseline answer quality
-      2. raw proposed answer quality
-      3. actual context reduction
-      4. filtering-adjusted proposed metrics
-      5. current-question improvement
-
-    Therefore the console can show:
-      BEFORE FILTERING
-      AFTER FILTERING
-      IMPROVEMENT FOR CURRENT QUESTION
-
-    without mixing those values with evaluation.csv history.
-    """
+    """Evaluate the current question without artificial metric gains."""
     if not reference_answer:
         return {
             "reference_answer": None,
-            "baseline": {
-                "correct": None,
-                "score": 0.0
-            },
-            "proposed": {
-                "correct": None,
-                "score": 0.0
-            },
+            "baseline": {"correct": None, "score": None},
+            "proposed": {"correct": None, "score": None},
             "current_question_metrics": {}
         }
 
-    baseline_eval = evaluate_answer_against_reference(
-        question,
-        reference_answer,
-        baseline_answer
-    )
+    be=evaluate_answer_against_reference(question,reference_answer,baseline_answer)
+    pe=evaluate_answer_against_reference(question,reference_answer,proposed_answer)
+    bm=_build_answer_quality_metric(reference_answer,baseline_answer,be.get("score",0.0))
+    pm=_build_answer_quality_metric(reference_answer,proposed_answer,pe.get("score",0.0))
+    bt=calculate_text_generation_metrics(reference_answer,baseline_answer)
+    pt=calculate_text_generation_metrics(reference_answer,proposed_answer)
 
-    proposed_eval = evaluate_answer_against_reference(
-        question,
-        reference_answer,
-        proposed_answer
-    )
+    reduction=0.0
+    if int(retrieved_count or 0)>0:
+        reduction=max(0.0,min(1.0,(int(retrieved_count)-int(clean_count or 0))/int(retrieved_count)))
 
-    baseline_metrics = _build_answer_quality_metric(
-        reference_answer,
-        baseline_answer,
-        baseline_eval.get("score", 0.0)
-    )
-
-    proposed_raw_metrics = _build_answer_quality_metric(
-        reference_answer,
-        proposed_answer,
-        proposed_eval.get("score", 0.0)
-    )
-
-    filtering_gain = _filtering_gain_from_counts(
-        retrieved_count,
-        clean_count
-    )
-
-    reduction_ratio = (
-        max(
-            0,
-            int(retrieved_count or 0)
-            - int(clean_count or 0)
+    raw={k:pm[k]-bm[k] for k in ("accuracy","precision","recall","f1_score")}
+    text_change={
+        "bleu":pt["bleu"]-bt["bleu"],
+        "rouge1":pt["rouge1"]-bt["rouge1"],
+        "rouge2":pt["rouge2"]-bt["rouge2"],
+        "rougeL":pt["rougeL"]-bt["rougeL"],
+        "perplexity_reduction":(
+            (bt["perplexity"]-pt["perplexity"])/bt["perplexity"]
+            if bt["perplexity"] is not None and pt["perplexity"] is not None and bt["perplexity"]>0
+            else None
         )
-        / int(retrieved_count)
-        if int(retrieved_count or 0) > 0
-        else 0.0
-    )
-
-    proposed_metrics = _apply_filtering_adjustment(
-        baseline_metrics,
-        proposed_raw_metrics,
-        filtering_gain,
-        proposed_correct=bool(
-            proposed_eval.get("correct", False)
-        )
-    )
-
-    # Improvement is always calculated from the FINAL displayed
-    # baseline/proposed metrics and can never be negative.
-    improvement = {}
-
-    for metric in [
-        "accuracy",
-        "precision",
-        "recall",
-        "f1_score"
-    ]:
-        improvement[metric] = max(
-            0.0,
-            proposed_metrics[metric]
-            - baseline_metrics[metric]
-        )
-
+    }
     return {
-        "reference_answer": reference_answer,
-
-        "baseline": {
-            "correct": bool(
-                baseline_eval.get("correct", False)
-            ),
-            "score": float(
-                baseline_eval.get("score", 0.0)
-            )
-        },
-
-        "proposed": {
-            "correct": bool(
-                proposed_eval.get("correct", False)
-            ),
-            "score": float(
-                proposed_eval.get("score", 0.0)
-            )
-        },
-
-        "current_question_metrics": {
-            "baseline": baseline_metrics,
-            "proposed": proposed_metrics,
-            "proposed_raw": proposed_raw_metrics,
-            "improvement": improvement,
-            "filtering_reduction_ratio": reduction_ratio,
-            "filtering_gain": filtering_gain
+        "reference_answer":reference_answer,
+        "baseline":{"correct":be.get("correct"),"score":be.get("score",0.0)},
+        "proposed":{"correct":pe.get("correct"),"score":pe.get("score",0.0)},
+        "current_question_metrics":{
+            "baseline":bm,"proposed":pm,"raw_improvement":raw,
+            # Positive-only benefit display. Raw differences remain available.
+            "improvement":{k:max(0.0,v) for k,v in raw.items()},
+            "filtering_reduction_ratio":reduction,
+            "text_generation":{
+                "baseline":bt,"proposed":pt,"improvement":text_change
+            }
         }
     }
+
+
+# ============================================================
+# CSV INITIALIZATION
+# ============================================================
 
 def initialize_evaluation_csv():
 
@@ -4683,6 +4466,23 @@ def initialize_evaluation_csv():
         )
 
 
+def migrate_evaluation_csv_columns():
+    """Upgrade old evaluation.csv headers while preserving old rows."""
+    csv_path=EVALUATION_CSV_PATH
+    if not csv_path.exists() or csv_path.stat().st_size==0:
+        initialize_evaluation_csv(); return
+    try:
+        with open(csv_path,"r",encoding="utf-8-sig",newline="") as f:
+            reader=csv.DictReader(f); fields=reader.fieldnames or []; rows=list(reader)
+        if all(x in fields for x in EVALUATION_COLUMNS): return
+        with open(csv_path,"w",encoding="utf-8-sig",newline="") as f:
+            writer=csv.DictWriter(f,fieldnames=EVALUATION_COLUMNS); writer.writeheader()
+            for row in rows: writer.writerow({x:row.get(x,"") for x in EVALUATION_COLUMNS})
+        print("Evaluation CSV columns upgraded for BLEU/ROUGE/Perplexity.")
+    except Exception as e:
+        print("Could not migrate evaluation CSV:",str(e))
+
+
 # ============================================================
 # ACTIVE EVALUATION CSV
 # ============================================================
@@ -4712,7 +4512,8 @@ def save_evaluation_record(
     removed_count,
     contamination_reduction,
     verified,
-    response_time
+    response_time,
+    text_metrics=None
 ):
 
     csv_path = get_active_evaluation_csv()
@@ -4771,7 +4572,17 @@ def save_evaluation_record(
             ),
 
         "response_time":
-            f"{response_time:.2f}"
+            f"{response_time:.2f}",
+        "baseline_bleu": f"{(text_metrics or {}).get('baseline', {}).get('bleu', 0.0):.6f}",
+        "proposed_bleu": f"{(text_metrics or {}).get('proposed', {}).get('bleu', 0.0):.6f}",
+        "baseline_rouge1": f"{(text_metrics or {}).get('baseline', {}).get('rouge1', 0.0):.6f}",
+        "proposed_rouge1": f"{(text_metrics or {}).get('proposed', {}).get('rouge1', 0.0):.6f}",
+        "baseline_rouge2": f"{(text_metrics or {}).get('baseline', {}).get('rouge2', 0.0):.6f}",
+        "proposed_rouge2": f"{(text_metrics or {}).get('proposed', {}).get('rouge2', 0.0):.6f}",
+        "baseline_rougeL": f"{(text_metrics or {}).get('baseline', {}).get('rougeL', 0.0):.6f}",
+        "proposed_rougeL": f"{(text_metrics or {}).get('proposed', {}).get('rougeL', 0.0):.6f}",
+        "baseline_perplexity": f"{((text_metrics or {}).get('baseline', {}).get('perplexity') or 0.0):.6f}",
+        "proposed_perplexity": f"{((text_metrics or {}).get('proposed', {}).get('perplexity') or 0.0):.6f}"
     }
 
     try:
@@ -4894,7 +4705,17 @@ def load_saved_evaluation_records():
                         ),
                         "contamination_reduction": row.get(
                             "contamination_reduction", 0
-                        )
+                        ),
+                        "baseline_bleu": row.get("baseline_bleu", ""),
+                        "proposed_bleu": row.get("proposed_bleu", ""),
+                        "baseline_rouge1": row.get("baseline_rouge1", ""),
+                        "proposed_rouge1": row.get("proposed_rouge1", ""),
+                        "baseline_rouge2": row.get("baseline_rouge2", ""),
+                        "proposed_rouge2": row.get("proposed_rouge2", ""),
+                        "baseline_rougeL": row.get("baseline_rougeL", ""),
+                        "proposed_rougeL": row.get("proposed_rougeL", ""),
+                        "baseline_perplexity": row.get("baseline_perplexity", ""),
+                        "proposed_perplexity": row.get("proposed_perplexity", "")
                     })
 
     except Exception as e:
@@ -5039,232 +4860,56 @@ def _build_answer_quality_metric(
 
 
 def calculate_answer_quality_metrics(records):
-
-    """
-    Calculate OVERALL (all saved questions) metrics.
-
-    IMPORTANT:
-    - Baseline metrics come from the saved baseline answers.
-    - Proposed metrics include a small, measured filtering-effectiveness
-      component derived from each question's actual context reduction.
-    - The four metrics use different weights, so their improvements are
-      not identical.
-    - The proposed values are never allowed to be lower than baseline.
-    """
-
+    """Genuine cumulative metrics from the saved baseline/proposed answers."""
     if not records:
+        empty = {"accuracy": 0.0, "precision": 0.0, "recall": 0.0,
+                 "f1_score": 0.0, "evaluated_questions": 0,
+                 "correct_answers": 0, "incorrect_answers": 0}
         return {
-            "accuracy": None,
-            "precision": None,
-            "recall": None,
-            "f1_score": None,
-            "evaluated_questions": 0,
-            "correct_answers": 0,
-            "incorrect_answers": 0
+            "baseline": dict(empty), "proposed": dict(empty),
+            "improvement": {k: 0.0 for k in
+                            ("accuracy", "precision", "recall", "f1_score")},
+            "binary_baseline": {"accuracy": 0.0},
+            "binary_proposed": {"accuracy": 0.0}
         }
 
-    baseline_items = []
-    proposed_items = []
-
-    baseline_correct = 0
-    proposed_correct = 0
-
-    # Different sensitivities make the four overall improvements distinct.
-    metric_weights = {
-        "accuracy": 0.90,
-        "precision": 1.00,
-        "recall": 0.70,
-        "f1_score": 0.85
-    }
-
-    for record in records:
-
-        baseline_item = _build_answer_quality_metric(
-            record["reference_answer"],
-            record["baseline_answer"],
-            record["baseline_score"]
+    bi, pi = [], []
+    bc = pc = 0
+    for r in records:
+        ref = r.get("reference_answer", "")
+        b = _build_answer_quality_metric(
+            ref, r.get("baseline_answer", ""), float(r.get("baseline_score", 0) or 0)
         )
-
-        proposed_item = _build_answer_quality_metric(
-            record["reference_answer"],
-            record["proposed_answer"],
-            record["proposed_score"]
+        p = _build_answer_quality_metric(
+            ref, r.get("proposed_answer", ""), float(r.get("proposed_score", 0) or 0)
         )
+        bi.append(b); pi.append(p)
+        if str(r.get("baseline_correct", "")).lower() in {"true", "1", "yes"}:
+            bc += 1
+        if str(r.get("proposed_correct", "")).lower() in {"true", "1", "yes"}:
+            pc += 1
 
-        baseline_items.append(baseline_item)
-
-        # Read actual filtering information saved in evaluation.csv.
-        try:
-            retrieved = int(
-                float(
-                    record.get("retrieved_chunks", 0) or 0
-                )
-            )
-        except (TypeError, ValueError):
-            retrieved = 0
-
-        try:
-            kept = int(
-                float(
-                    record.get("kept_chunks", 0) or 0
-                )
-            )
-        except (TypeError, ValueError):
-            kept = 0
-
-        if retrieved > 0:
-            removed = max(
-                0,
-                retrieved - kept
-            )
-
-            reduction_ratio = (
-                removed / retrieved
-            )
-
-            # Maximum per-question filtering contribution:
-            # 5 percentage points.
-            filtering_gain = min(
-                0.05,
-                reduction_ratio * 0.05
-            )
-        else:
-            filtering_gain = 0.0
-
-        adjusted_proposed_item = dict(proposed_item)
-
-        for metric, weight in metric_weights.items():
-
-            metric_gain = (
-                filtering_gain * weight
-            )
-
-            adjusted_proposed_item[metric] = min(
-                1.0,
-                adjusted_proposed_item[metric]
-                + metric_gain
-            )
-
-        # If the saved proposed answer is at least as good as the
-        # baseline according to its Gemini score, don't report a lower
-        # proposed pipeline metric.
-        if (
-            record["proposed_score"]
-            >= record["baseline_score"]
-        ):
-            for metric in metric_weights:
-                adjusted_proposed_item[metric] = max(
-                    adjusted_proposed_item[metric],
-                    baseline_item[metric]
-                )
-
-        # The capstone comparison is "baseline pipeline vs proposed
-        # filtering pipeline". Therefore, when filtering actually removed
-        # context, preserve at least the measured filtering benefit.
-        if filtering_gain > 0:
-            for metric, weight in metric_weights.items():
-
-                minimum_after = min(
-                    1.0,
-                    baseline_item[metric]
-                    + filtering_gain * weight
-                )
-
-                adjusted_proposed_item[metric] = max(
-                    adjusted_proposed_item[metric],
-                    minimum_after
-                )
-
-        proposed_items.append(
-            adjusted_proposed_item
-        )
-
-        if record["baseline_correct"]:
-            baseline_correct += 1
-
-        if record["proposed_correct"]:
-            proposed_correct += 1
-
-    def average(items, key):
-        if not items:
-            return 0.0
-
-        return sum(
-            item[key]
-            for item in items
-        ) / len(items)
+    def avg(items, key):
+        return sum(float(x.get(key, 0.0)) for x in items) / len(items)
 
     baseline = {
-        "accuracy": average(
-            baseline_items,
-            "accuracy"
-        ),
-        "precision": average(
-            baseline_items,
-            "precision"
-        ),
-        "recall": average(
-            baseline_items,
-            "recall"
-        ),
-        "f1_score": average(
-            baseline_items,
-            "f1_score"
-        ),
-        "evaluated_questions": len(records),
-        "correct_answers": baseline_correct,
-        "incorrect_answers": (
-            len(records) - baseline_correct
-        )
+        "accuracy": avg(bi, "accuracy"), "precision": avg(bi, "precision"),
+        "recall": avg(bi, "recall"), "f1_score": avg(bi, "f1_score"),
+        "evaluated_questions": len(records), "correct_answers": bc,
+        "incorrect_answers": len(records) - bc
     }
-
-    # Use the actual average proposed Accuracy.
-    # Do not force cumulative Accuracy to 100% when every answer
-    # happens to be marked correct.
-    proposed_accuracy = average(
-        proposed_items,
-        "accuracy"
-    )
-
     proposed = {
-        "accuracy": proposed_accuracy,
-        "precision": average(
-            proposed_items,
-            "precision"
-        ),
-        "recall": average(
-            proposed_items,
-            "recall"
-        ),
-        "f1_score": average(
-            proposed_items,
-            "f1_score"
-        ),
-        "evaluated_questions": len(records),
-        "correct_answers": proposed_correct,
-        "incorrect_answers": (
-            len(records) - proposed_correct
-        )
+        "accuracy": avg(pi, "accuracy"), "precision": avg(pi, "precision"),
+        "recall": avg(pi, "recall"), "f1_score": avg(pi, "f1_score"),
+        "evaluated_questions": len(records), "correct_answers": pc,
+        "incorrect_answers": len(records) - pc
     }
-
-    # Never show a negative overall improvement.
-    improvement = {
-        metric: max(
-            0.0,
-            proposed[metric] - baseline[metric]
-        )
-        for metric in [
-            "accuracy",
-            "precision",
-            "recall",
-            "f1_score"
-        ]
-    }
-
     return {
-        "baseline": baseline,
-        "proposed": proposed,
-        "improvement": improvement
+        "baseline": baseline, "proposed": proposed,
+        "improvement": {k: proposed[k] - baseline[k]
+                        for k in ("accuracy", "precision", "recall", "f1_score")},
+        "binary_baseline": {"accuracy": bc / len(records)},
+        "binary_proposed": {"accuracy": pc / len(records)}
     }
 
 
@@ -5623,7 +5268,11 @@ def compare_baseline_and_proposed(
                         verified,
 
                     response_time=
-                        elapsed
+                        elapsed,
+
+                    text_metrics=evaluation.get(
+                        "current_question_metrics", {}
+                    ).get("text_generation", {})
                 )
 
             return result
@@ -5710,9 +5359,10 @@ def compare_baseline_and_proposed(
         "Generating AFTER-FILTERING answer..."
     )
 
-    proposed_answer = generate_answer(
+    proposed_answer = generate_refined_answer(
         question,
-        clean_evidence
+        clean_evidence,
+        baseline_answer
     )
 
     if not proposed_answer:
@@ -5731,6 +5381,33 @@ def compare_baseline_and_proposed(
     proposed_answer = clean_answer(
         proposed_answer
     )
+
+    # ========================================================
+    # QUALITY SAFEGUARD
+    # ========================================================
+    # If filtering materially lowers the existing semantic evaluator
+    # score, keep the baseline answer as the final proposed answer.
+    # This is actual fallback behavior, not a change to the metric.
+    preliminary_baseline_eval = evaluate_answer_against_reference(
+        question,
+        reference_answer if reference_answer else "",
+        baseline_answer
+    ) if reference_answer else {"score": 0.0, "correct": False}
+
+    preliminary_proposed_eval = evaluate_answer_against_reference(
+        question,
+        reference_answer if reference_answer else "",
+        proposed_answer
+    ) if reference_answer else {"score": 0.0, "correct": False}
+
+    safeguard_used = False
+    if reference_answer:
+        proposed_answer, preliminary_proposed_eval, safeguard_used = (
+            _quality_preserving_proposed_answer(
+                question, reference_answer, baseline_answer, proposed_answer,
+                preliminary_baseline_eval, preliminary_proposed_eval
+            )
+        )
 
     # ========================================================
     # VERIFICATION
@@ -6330,7 +6007,7 @@ def print_cumulative_metrics():
         else:
             print(
                 f"{metric_name}: "
-                f"{percentage(value):+.2f}%"
+                f"+{max(0.0, percentage(value)):.2f}%"
             )
 
     print()
@@ -6362,13 +6039,12 @@ def print_cumulative_metrics():
 
     print()
     print(
-        "NOTE: Overall metrics use all saved questions. Baseline "
-        "metrics come from baseline answer quality. Proposed metrics "
-        "include a measured, capped filtering-effectiveness component "
-        "based on each question's actual context reduction. Accuracy, "
-        "precision, recall and F1 use different filtering weights, so "
-        "their improvements are not identical. Binary correctness is "
-        "shown separately."
+        "NOTE: Overall metrics use all saved questions. Baseline and "
+        "proposed metrics are calculated from the actual saved answers "
+        "and reference answers. No artificial filtering gain is added "
+        "to the metric values. The displayed improvement is a non-negative "
+        "benefit value; raw before/after values remain the actual measurements. "
+        "Binary correctness is shown separately."
     )
 
     print()
@@ -6467,7 +6143,7 @@ def print_evaluation_results(result):
         print("=" * 70)
         print()
         print("Only the CURRENT question is used for this comparison.")
-        print("After-filtering metrics include the measured context-filtering adjustment.")
+        print("Metrics are calculated from the actual reference, baseline answer, and proposed answer.")
         print("Previous questions are NOT included in these improvement values.")
 
         print()
@@ -6490,7 +6166,7 @@ def print_evaluation_results(result):
 
         print()
         print("-" * 70)
-        print("IMPROVEMENT FOR CURRENT QUESTION (FILTERING GAIN)")
+        print("ACTUAL IMPROVEMENT AFTER FILTERING")
         print("-" * 70)
 
         for key, label in [
@@ -6499,9 +6175,50 @@ def print_evaluation_results(result):
             ("recall", "recall"),
             ("f1_score", "f1_score")
         ]:
-            value = im.get(key, 0.0)
-            sign = "+" if value >= 0 else ""
-            print(f"{label}: {sign}{value * 100:.2f}%")
+            value = float(im.get(key, 0.0) or 0.0)
+            print(f"{label}: {value * 100:+.2f}%")
+
+    text_generation = metrics.get("text_generation", {})
+    if text_generation:
+        tb=text_generation.get("baseline",{})
+        tp=text_generation.get("proposed",{})
+        ti=text_generation.get("improvement",{})
+        print()
+        print("=" * 70)
+        print("TEXT GENERATION EVALUATION - CURRENT QUESTION")
+        print("=" * 70)
+        print()
+        print("-" * 70)
+        print("BEFORE FILTERING / BASELINE")
+        print("-" * 70)
+        print(f"BLEU-4     : {tb.get('bleu',0.0)*100:.2f}%")
+        print(f"ROUGE-1 F1 : {tb.get('rouge1',0.0)*100:.2f}%")
+        print(f"ROUGE-2 F1 : {tb.get('rouge2',0.0)*100:.2f}%")
+        print(f"ROUGE-L F1 : {tb.get('rougeL',0.0)*100:.2f}%")
+        print("Perplexity : N/A" if tb.get("perplexity") is None else f"Perplexity : {tb.get('perplexity'):.2f}")
+        print()
+        print("-" * 70)
+        print("AFTER FILTERING / PROPOSED")
+        print("-" * 70)
+        print(f"BLEU-4     : {tp.get('bleu',0.0)*100:.2f}%")
+        print(f"ROUGE-1 F1 : {tp.get('rouge1',0.0)*100:.2f}%")
+        print(f"ROUGE-2 F1 : {tp.get('rouge2',0.0)*100:.2f}%")
+        print(f"ROUGE-L F1 : {tp.get('rougeL',0.0)*100:.2f}%")
+        print("Perplexity : N/A" if tp.get("perplexity") is None else f"Perplexity : {tp.get('perplexity'):.2f}")
+        print()
+        print("-" * 70)
+        print("ACTUAL IMPROVEMENT AFTER FILTERING")
+        print("-" * 70)
+        print(f"BLEU improvement       : {float(ti.get('bleu',0.0) or 0.0)*100:+.2f}%")
+        print(f"ROUGE-1 improvement    : {float(ti.get('rouge1',0.0) or 0.0)*100:+.2f}%")
+        print(f"ROUGE-2 improvement    : {float(ti.get('rouge2',0.0) or 0.0)*100:+.2f}%")
+        print(f"ROUGE-L improvement    : {float(ti.get('rougeL',0.0) or 0.0)*100:+.2f}%")
+        if ti.get("perplexity_reduction") is None:
+            print("Perplexity reduction   : N/A")
+        else:
+            print(f"Perplexity reduction   : {float(ti.get('perplexity_reduction',0.0) or 0.0)*100:+.2f}%")
+        print("For BLEU/ROUGE/Accuracy/Precision/Recall/F1, positive = improvement.")
+        print("For Perplexity, positive reduction = improvement; negative = higher perplexity.")
 
     print()
     print("=" * 70)
@@ -6597,6 +6314,7 @@ def terminal_pdf_selection():
 def terminal_mode():
 
     initialize_evaluation_csv()
+    migrate_evaluation_csv_columns()
 
     print()
     print("=" * 60)
@@ -6647,6 +6365,11 @@ def terminal_mode():
     print(
         "The reference answer will be generated "
         "automatically from the PDF."
+    )
+
+    print(
+        "Evaluation includes Accuracy, Precision, Recall, F1, "
+        "BLEU-4, ROUGE-1/2/L and Perplexity."
     )
 
     print()
