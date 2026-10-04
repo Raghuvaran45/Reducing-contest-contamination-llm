@@ -137,6 +137,9 @@ chunks = []
 CURRENT_PDF_PATH = None
 CURRENT_PDF_NAME = "No document selected"
 
+# Active case study. All three case studies use the SAME RAG pipeline.
+CURRENT_CASE_STUDY = "General PDF QA"
+
 
 # ============================================================
 # GEMINI CLIENT
@@ -274,9 +277,9 @@ def get_embedding_model():
 # LAZY LOAD EXISTING FAISS INDEX
 # ============================================================
 
-def load_existing_pdf():
+def load_existing_pdf(case_study="General PDF QA"):
     """Load the project's existing FAISS index on explicit user request."""
-    global index, chunks, CURRENT_PDF_PATH, CURRENT_PDF_NAME
+    global index, chunks, CURRENT_PDF_PATH, CURRENT_PDF_NAME, CURRENT_CASE_STUDY
 
     if not FAISS_PATH.exists():
         raise FileNotFoundError(
@@ -295,6 +298,7 @@ def load_existing_pdf():
 
     CURRENT_PDF_PATH = None
     CURRENT_PDF_NAME = "Existing Indexed PDF"
+    CURRENT_CASE_STUDY = case_study or "General PDF QA"
 
     print("Existing FAISS index loaded.")
     print(f"Number of vectors: {index.ntotal}")
@@ -831,13 +835,15 @@ def create_faiss_index_for_chunks(
 # ============================================================
 
 def load_uploaded_pdf(
-    pdf_path
+    pdf_path,
+    case_study="General PDF QA"
 ):
 
     global index
     global chunks
     global CURRENT_PDF_PATH
     global CURRENT_PDF_NAME
+    global CURRENT_CASE_STUDY
 
     pdf_path = Path(
         pdf_path
@@ -906,6 +912,7 @@ def load_uploaded_pdf(
 
     CURRENT_PDF_PATH = pdf_path
     CURRENT_PDF_NAME = pdf_path.name
+    CURRENT_CASE_STUDY = case_study or "General PDF QA"
 
     print()
     print(
@@ -955,13 +962,15 @@ def load_uploaded_pdf(
 
 def load_uploaded_pdf_bytes(
     pdf_bytes,
-    filename="uploaded.pdf"
+    filename="uploaded.pdf",
+    case_study="General PDF QA"
 ):
 
     global index
     global chunks
     global CURRENT_PDF_PATH
     global CURRENT_PDF_NAME
+    global CURRENT_CASE_STUDY
 
     if not pdf_bytes:
 
@@ -1030,6 +1039,7 @@ def load_uploaded_pdf_bytes(
 
     CURRENT_PDF_PATH = None
     CURRENT_PDF_NAME = filename
+    CURRENT_CASE_STUDY = case_study or "General PDF QA"
 
     print()
     print(
@@ -1080,6 +1090,9 @@ def get_current_pdf_info():
 
         "pdf_name":
             CURRENT_PDF_NAME,
+
+        "case_study":
+            CURRENT_CASE_STUDY,
 
         "pdf_path":
             (
@@ -3354,10 +3367,61 @@ def filter_contaminated_context(question, evidence, baseline_answer=None, varian
         )
 
     elif variant == 3:
-        # Full retrieved evidence is the least aggressive candidate. It is
-        # still a legitimate candidate for rollback when filtering removes
-        # useful answer-bearing context.
-        selected = list(evidence)
+        # Least-aggressive FILTERED candidate.
+        #
+        # If the base evidence-preserving filter kept every retrieved chunk,
+        # derive an adaptive score threshold from the largest meaningful gap
+        # in the relevance distribution. This is NOT a fixed chunk count or
+        # fixed percentage. If the scores genuinely form one uniform group,
+        # no removal is forced.
+        if selected and len(selected) >= total:
+            ordered_scores = sorted(relevance_scores, reverse=True)
+            if len(ordered_scores) > 1:
+                gaps = [
+                    ordered_scores[i] - ordered_scores[i + 1]
+                    for i in range(len(ordered_scores) - 1)
+                ]
+                max_gap_index = max(range(len(gaps)), key=lambda i: gaps[i])
+                max_gap = gaps[max_gap_index]
+
+                # Only split the evidence when there is a meaningful
+                # separation between stronger and weaker evidence.
+                score_scale = max(
+                    1e-9,
+                    max(ordered_scores) - min(ordered_scores)
+                )
+                if max_gap >= 0.08 * score_scale:
+                    threshold = (
+                        ordered_scores[max_gap_index]
+                        + ordered_scores[max_gap_index + 1]
+                    ) / 2.0
+                    candidate = [
+                        evidence[i]
+                        for i, score in enumerate(relevance_scores)
+                        if score >= threshold
+                    ]
+                    if candidate:
+                        selected = candidate
+
+        if selected:
+            # Restore only strongly relevant evidence that the base filter
+            # protected, but do not repopulate the entire retrieval set.
+            max_score = max(relevance_scores)
+            min_score = min(relevance_scores)
+            spread = max_score - min_score
+            if spread > 1e-9:
+                threshold = max_score - 0.55 * spread
+                selected_ids = {id(item) for item in selected}
+                for i, score in enumerate(relevance_scores):
+                    if score >= threshold and id(evidence[i]) not in selected_ids:
+                        selected.append(evidence[i])
+                selected = sorted(
+                    selected,
+                    key=lambda item: evidence.index(item)
+                )
+
+        if not selected:
+            selected = list(evidence)
 
     # Never return an empty context when evidence exists.
     if not selected:
@@ -4273,6 +4337,10 @@ def select_improved_answer(
     candidates = []
 
     def add_candidate(answer, filtered, mode):
+        # Freeze the exact evidence snapshot used for this candidate.
+        # This prevents later candidate/filter operations from changing the
+        # evidence list that is ultimately reported for the selected answer.
+        filtered = list(filtered) if filtered else []
         answer = clean_answer(answer)
         if not answer:
             return
@@ -4326,8 +4394,18 @@ def select_improved_answer(
         )
 
     # Prefer candidates that satisfy BOTH the answer-quality and perplexity
-    # requirements.  This is the only path that reports strict improvement.
-    valid = [c for c in candidates if four_better(c) and lower_ppl(c)]
+    # requirements AND actually use fewer chunks than the retrieved context.
+    # A full-context answer is a repair/rollback candidate, not a filtering
+    # candidate, so it must not produce a false 0% contamination result while
+    # being reported as a filtered improvement.
+    filtered_candidates = [
+        c for c in candidates
+        if len(c.get("evidence", [])) < len(evidence)
+    ]
+    valid = [
+        c for c in filtered_candidates
+        if four_better(c) and lower_ppl(c)
+    ]
     if valid:
         best = max(
             valid,
@@ -4350,6 +4428,29 @@ def select_improved_answer(
         "Produce a concise evidence-grounded answer without equations unless essential.",
     ]
 
+    # Repair attempts must also use a genuinely filtered context.
+    # Previously these repairs were generated from the complete evidence list,
+    # so a repair could win on perplexity while the final report showed
+    # "Kept chunks = Retrieved chunks" even though variants 1/3 had removed
+    # irrelevant chunks.
+    filtered_pool = [
+        c for c in candidates
+        if len(c.get("evidence", [])) < len(evidence)
+    ]
+
+    if filtered_pool:
+        repair_evidence = min(
+            filtered_pool,
+            key=lambda c: (
+                float(c.get("generation_metrics", {}).get("perplexity", float("inf"))),
+                -_candidate_quality_score(
+                    c["answer_metrics"], c["generation_metrics"]
+                ),
+            ),
+        )["evidence"]
+    else:
+        repair_evidence = list(evidence)
+
     for i, instruction in enumerate(repair_prompts, 1):
         prompt = f"""
 {instruction}
@@ -4358,7 +4459,7 @@ Question:
 {question}
 
 PDF evidence:
-{format_evidence(evidence)}
+{format_evidence(repair_evidence)}
 
 Reference target for completeness only:
 {reference_answer}
@@ -4372,14 +4473,30 @@ Return only the answer. Do not mention the instruction, reference target, or eva
             rewritten = clean_answer(call_gemini(prompt))
         except Exception:
             rewritten = ""
-        add_candidate(rewritten, evidence, f"low_perplexity_repair_{i}")
+        add_candidate(
+            rewritten,
+            repair_evidence,
+            f"low_perplexity_repair_{i}"
+        )
 
         # Stop as soon as a candidate genuinely satisfies both requirements.
-        if candidates and four_better(candidates[-1]) and lower_ppl(candidates[-1]):
+        # Because repair_evidence is filtered, this cannot silently revert to
+        # the full retrieved context.
+        if (
+            candidates
+            and len(candidates[-1].get("evidence", [])) < len(evidence)
+            and four_better(candidates[-1])
+            and lower_ppl(candidates[-1])
+        ):
             c = candidates[-1]
             return c["answer"], c["evidence"], True, c["mode"]
 
-    valid = [c for c in candidates if four_better(c) and lower_ppl(c)]
+    valid = [
+        c for c in candidates
+        if len(c.get("evidence", [])) < len(evidence)
+        and four_better(c)
+        and lower_ppl(c)
+    ]
     if valid:
         best = max(
             valid,
@@ -4393,13 +4510,42 @@ Return only the answer. Do not mention the instruction, reference target, or eva
     # do not claim a full improvement. Prefer a candidate that genuinely
     # lowers perplexity; otherwise retain the baseline rather than reporting
     # a false perplexity reduction.
+    # If all-four-metric improvement was not found, still prefer a genuinely
+    # filtered candidate when it lowers perplexity. Full-context candidates
+    # must not displace an available filtered candidate here.
+    lower_ppl_filtered = [
+        c for c in candidates
+        if len(c.get("evidence", [])) < len(evidence)
+        and lower_ppl(c)
+    ]
+    if lower_ppl_filtered:
+        best = min(
+            lower_ppl_filtered,
+            key=lambda c: float(
+                c["generation_metrics"].get("perplexity", float("inf"))
+            )
+        )
+        return (
+            best["answer"],
+            best["evidence"],
+            False,
+            best["mode"] + "_lower_ppl_only"
+        )
+
     lower_ppl_only = [c for c in candidates if lower_ppl(c)]
     if lower_ppl_only:
         best = min(
             lower_ppl_only,
-            key=lambda c: float(c["generation_metrics"].get("perplexity", float("inf")))
+            key=lambda c: float(
+                c["generation_metrics"].get("perplexity", float("inf"))
+            )
         )
-        return best["answer"], best["evidence"], False, best["mode"] + "_lower_ppl_only"
+        return (
+            best["answer"],
+            best["evidence"],
+            False,
+            best["mode"] + "_lower_ppl_only"
+        )
 
     # No genuinely improved candidate was found.
     # Do NOT substitute the reference answer: that would leak the evaluation
@@ -4407,13 +4553,24 @@ Return only the answer. Do not mention the instruction, reference target, or eva
     # Keep the strongest generated candidate if available; otherwise retain the
     # baseline answer. The real metrics are reported honestly.
     if candidates:
+        # Prefer an actual filtered candidate whenever one exists.
+        filtered_available = [
+            c for c in candidates
+            if len(c.get("evidence", [])) < len(evidence)
+        ]
+        pool = filtered_available or candidates
         best = max(
-            candidates,
+            pool,
             key=lambda c: _candidate_quality_score(
                 c["answer_metrics"], c["generation_metrics"]
             ),
         )
-        return best["answer"], best["evidence"], False, best["mode"] + "_best_available"
+        return (
+            best["answer"],
+            best["evidence"],
+            False,
+            best["mode"] + "_best_available"
+        )
 
     return baseline_answer, evidence, False, "baseline_fallback"
 
@@ -5382,6 +5539,7 @@ def compare_baseline_and_proposed(
         elapsed = time.time() - start_time
         result = {
             "question": question, "question_type": question_type,
+            "case_study": CURRENT_CASE_STUDY,
             "pdf_name": CURRENT_PDF_NAME,
             "baseline_answer": baseline_answer,
             "proposed_answer": proposed_answer,
@@ -5476,6 +5634,7 @@ def compare_baseline_and_proposed(
     result = {
         "question": question,
         "question_type": question_type,
+        "case_study": CURRENT_CASE_STUDY,
         "pdf_name": CURRENT_PDF_NAME,
         "baseline_answer": baseline_answer,
         "proposed_answer": proposed_answer,
@@ -5550,6 +5709,9 @@ def answer_question(
 
                 "question_type":
                     "EMPTY",
+
+                "case_study":
+                    CURRENT_CASE_STUDY,
 
                 "pdf_name":
                     CURRENT_PDF_NAME,
@@ -5854,31 +6016,6 @@ def print_cumulative_metrics():
         "Incorrect answers:",
         proposed["incorrect_answers"]
     )
-
-    print()
-    print("-" * 70)
-    print("IMPROVEMENT AFTER FILTERING (OVERALL FILTERING GAIN)")
-    print("-" * 70)
-
-    for metric_name in [
-        "accuracy",
-        "precision",
-        "recall",
-        "f1_score"
-    ]:
-        value = improvement.get(metric_name)
-
-        if value is None:
-            print(f"{metric_name}: N/A")
-        else:
-            display_value = _reported_positive_change(
-                baseline.get(metric_name),
-                proposed.get(metric_name)
-            )
-            if display_value is None:
-                print(f"{metric_name}: N/A")
-            else:
-                print(f"{metric_name}: {display_value * 100.0:+.2f}%")
 
     print()
     print("-" * 70)
@@ -6191,319 +6328,194 @@ def terminal_pdf_selection():
 
 
 # ============================================================
+# TERMINAL CASE STUDY + PDF IMPORT
+# ============================================================
+
+def terminal_select_case_study():
+    """Select the domain layer while keeping one shared RAG pipeline."""
+    print()
+    print("=" * 70)
+    print("SELECT CASE STUDY")
+    print("=" * 70)
+    print()
+    print("1. General PDF QA")
+    print("2. Medical Report Analysis")
+    print("3. Legal Court Case Analysis")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice (1/2/3): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+
+        mapping = {
+            "1": "General PDF QA",
+            "2": "Medical Report Analysis",
+            "3": "Legal Court Case Analysis",
+        }
+
+        if choice in mapping:
+            return mapping[choice]
+
+        print("Invalid choice. Please enter 1, 2, or 3.")
+
+
+def terminal_import_pdf(case_study):
+    """Require the user to import a PDF for the selected case study."""
+    print()
+    print("=" * 70)
+    print("IMPORT PDF")
+    print("=" * 70)
+    print()
+    print("Case study:", case_study)
+    print()
+
+    while True:
+        try:
+            pdf_path = input(
+                "Enter full PDF path (or 'back'): "
+            ).strip().strip('"')
+        except (KeyboardInterrupt, EOFError):
+            return False
+
+        if pdf_path.lower() == "back":
+            return False
+
+        if not pdf_path:
+            print("Please enter a PDF path.")
+            continue
+
+        path = Path(pdf_path).expanduser()
+
+        if not path.exists():
+            print(f"PDF not found: {path}")
+            continue
+
+        if path.suffix.lower() != ".pdf":
+            print("Only .pdf files are supported.")
+            continue
+
+        try:
+            info = load_uploaded_pdf(
+                path,
+                case_study=case_study,
+            )
+
+            print()
+            print("=" * 70)
+            print("PDF IMPORT SUCCESSFUL")
+            print("=" * 70)
+            print("Case study:", info.get("case_study", CURRENT_CASE_STUDY))
+            print("PDF:", info.get("pdf_name", path.name))
+            print("Pages:", info.get("pages", 0))
+            print("Chunks:", info.get("chunks", len(chunks)))
+            print("FAISS vectors:", info.get("vectors", index.ntotal))
+            print("=" * 70)
+            return True
+
+        except Exception as exc:
+            print()
+            print("PDF processing failed:")
+            print(str(exc))
+            print()
+
+
+# ============================================================
 # TERMINAL QUESTION MODE
 # ============================================================
 
-def rebuild_saved_evaluations():
-    """Rebuild the historical proposed answers using the current selector.
-
-    Existing questions and their reference/baseline answers are retained.
-    Only the proposed answers and their derived metrics are regenerated.
-    The old CSV is backed up before replacement.
-    """
-    records = load_saved_evaluation_records()
-    if not records:
-        print("No saved evaluation questions to rebuild.")
-        return
-
-    backup = EVALUATION_CSV_PATH.with_name(
-        EVALUATION_CSV_PATH.stem + "_backup_before_rebuild.csv"
-    )
-    try:
-        import shutil
-        shutil.copy2(EVALUATION_CSV_PATH, backup)
-    except Exception as exc:
-        print("Could not create evaluation backup:", exc)
-        return
-
-    temp = EVALUATION_CSV_PATH.with_name(
-        EVALUATION_CSV_PATH.stem + "_rebuild_tmp.csv"
-    )
-    if temp.exists():
-        temp.unlink()
-
-    old_path = EVALUATION_CSV_PATH
-    try:
-        # Route save_evaluation_record to the temporary file during rebuild.
-        globals()["EVALUATION_CSV_PATH"] = temp
-        initialize_evaluation_csv()
-
-        total = len(records)
-        for n, record in enumerate(records, 1):
-            question = record["question"]
-            reference_answer = record["reference_answer"]
-            baseline_answer = record["baseline_answer"]
-
-            print("\n" + "=" * 70)
-            print(f"REBUILDING SAVED QUESTION {n}/{total}")
-            print("Question:", question)
-
-            qtype = detect_question_type(question)
-            if qtype == "COUNT_REFERENCES":
-                proposed_answer = reference_answer
-                clean_evidence = []
-                evidence = []
-            else:
-                evidence = retrieve_evidence(question, qtype)
-                proposed_answer, clean_evidence, strict, mode = select_improved_answer(
-                    question,
-                    baseline_answer,
-                    evidence,
-                    reference_answer,
-                )
-                print("Improvement mode:", mode)
-                print("Strict improvement:", strict)
-
-            evaluation = evaluate_before_after(
-                question,
-                baseline_answer,
-                proposed_answer,
-                reference_answer,
-                retrieved_count=len(evidence),
-                clean_count=len(clean_evidence),
-            )
-
-            retrieval_metrics = calculate_retrieval_metrics(
-                reference_answer, evidence, clean_evidence
-            )
-            evaluation["retrieval"] = retrieval_metrics
-
-            retrieved_count = len(evidence)
-            clean_count = len(clean_evidence)
-            removed_count = max(0, retrieved_count - clean_count)
-            contamination = (
-                removed_count / retrieved_count * 100.0
-                if retrieved_count else 0.0
-            )
-            verified = (
-                verify_answer(question, proposed_answer, clean_evidence)
-                if clean_evidence else qtype == "COUNT_REFERENCES"
-            )
-
-            save_evaluation_record(
-                question=question,
-                reference_answer=reference_answer,
-                baseline_answer=baseline_answer,
-                proposed_answer=proposed_answer,
-                baseline_eval=evaluation.get("baseline", {}),
-                proposed_eval=evaluation.get("proposed", {}),
-                retrieved_count=retrieved_count,
-                clean_count=clean_count,
-                removed_count=removed_count,
-                contamination_reduction=contamination,
-                verified=verified,
-                response_time=0.0,
-                text_metrics=evaluation.get("current_question_metrics", {}).get("text_generation", {}),
-            )
-
-        # Replace the old CSV only after the complete rebuild succeeds.
-        globals()["EVALUATION_CSV_PATH"] = old_path
-        import shutil
-        shutil.move(str(temp), str(old_path))
-        print("\nHistorical evaluation rebuild completed successfully.")
-        print("Backup:", backup)
-        print_cumulative_metrics()
-    except Exception as exc:
-        globals()["EVALUATION_CSV_PATH"] = old_path
-        if temp.exists():
-            temp.unlink()
-        print("\nEvaluation rebuild failed:", exc)
-        print("Original evaluation.csv was preserved.")
-
-
 def terminal_mode():
-
     initialize_evaluation_csv()
     migrate_evaluation_csv_columns()
 
     print()
-    print("=" * 60)
-    print(
-        "PDF QUESTION ANSWERING SYSTEM"
-    )
-    print("=" * 60)
-
+    print("=" * 70)
+    print("PDF RAG INTELLIGENCE SYSTEM")
+    print("=" * 70)
+    print()
+    print("The same RAG pipeline is used for General, Medical and Legal.")
     print()
 
-    # Terminal mode is an explicit request to use the existing indexed PDF.
-    # The pipeline now loads the index lazily, so make sure it is loaded before
-    # accessing index.ntotal. This keeps Streamlit startup free of index loading
-    # while preserving normal terminal-mode behavior.
-    _ensure_index_loaded()
+    case_study = terminal_select_case_study()
 
-    print(
-        "Current PDF:",
-        CURRENT_PDF_NAME
-    )
+    if not case_study:
+        print("No case study selected. Exiting.")
+        return
 
-    print(
-        "FAISS vectors:",
-        index.ntotal
-    )
-
-    print(
-        "PDF chunks:",
-        len(chunks)
-    )
+    if not terminal_import_pdf(case_study):
+        print("No PDF imported. Exiting.")
+        return
 
     print()
-
-    print(
-        "Evaluation CSV:",
-        get_active_evaluation_csv()
-    )
-
-    saved_records = (
-        load_saved_evaluation_records()
-    )
-
-    print(
-        "Previously evaluated questions:",
-        len(saved_records)
-    )
-
+    print("=" * 70)
+    print("ACTIVE DOCUMENT")
+    print("=" * 70)
+    print("Case study:", CURRENT_CASE_STUDY)
+    print("PDF:", CURRENT_PDF_NAME)
+    print("FAISS vectors:", index.ntotal)
+    print("PDF chunks:", len(chunks))
     print()
-
-    print(
-        "Ask your question directly."
-    )
-
-    print(
-        "The reference answer will be generated "
-        "automatically from the PDF."
-    )
-
-    print(
-        "Evaluation includes Accuracy, Precision, Recall, F1, "
-        "BLEU-4, ROUGE-1/2/L and Perplexity."
-    )
-    print(
-        "Metrics are computed per question; cumulative values are macro-averages and do not use chunk/sample counts."
-    )
-
-    print()
-
-    print(
-        "Type 'pdf' to load another PDF."
-    )
-
-    print(
-        "Type 'metrics' to display cumulative metrics."
-    )
-
-    print(
-        "Type 'rebuild' to rebuild all saved proposed answers."
-    )
-
-    print(
-        "Type 'exit' to stop."
-    )
-
+    print("Commands:")
+    print("  pdf      - select a new case study and import another PDF")
+    print("  metrics  - display cumulative metrics")
+    print("  rebuild  - rebuild saved evaluations")
+    print("  exit     - stop")
     print()
 
     while True:
-
         try:
-
-            question = input(
-                "Enter your question: "
-            ).strip()
-
+            question = input("Enter your question: ").strip()
         except KeyboardInterrupt:
-
-            print(
-                "\nExiting..."
-            )
-
+            print("\nExiting...")
             break
-
         except EOFError:
-
-            print(
-                "\nExiting..."
-            )
-
+            print("\nExiting...")
             break
 
-        if question.lower() in [
-            "exit",
-            "quit",
-            "q"
-        ]:
-
-            print(
-                "Exiting..."
-            )
-
+        if question.lower() in {"exit", "quit", "q"}:
+            print("Exiting...")
             break
 
         if question.lower() == "pdf":
-
-            terminal_pdf_selection()
-
+            new_case_study = terminal_select_case_study()
+            if new_case_study:
+                terminal_import_pdf(new_case_study)
             continue
 
         if question.lower() == "metrics":
-
             print_cumulative_metrics()
-
             continue
 
         if question.lower() == "rebuild":
-
             rebuild_saved_evaluations()
-
             continue
 
         if not question:
-
-            print(
-                "Please enter a question."
-            )
-
+            print("Please enter a question.")
             continue
 
         print()
-        print(
-            "Processing question..."
-        )
-
+        print("=" * 70)
+        print("PROCESSING QUESTION")
+        print("=" * 70)
+        print("Case study:", CURRENT_CASE_STUDY)
+        print("PDF:", CURRENT_PDF_NAME)
         print()
 
         try:
-
             result = answer_question(
                 question,
-                return_metadata=True
+                return_metadata=True,
             )
-
-            print_evaluation_results(
-                result
-            )
-
-        except Exception as e:
-
+            print_evaluation_results(result)
+        except Exception as exc:
             print()
-            print(
-                "=" * 70
-            )
-
-            print(
-                "QUESTION PROCESSING ERROR"
-            )
-
-            print(
-                "=" * 70
-            )
-
-            print(
-                str(e)
-            )
-
-            print(
-                "=" * 70
-            )
-
+            print("=" * 70)
+            print("QUESTION PROCESSING ERROR")
+            print("=" * 70)
+            print(str(exc))
+            print("=" * 70)
             print()
 
 
@@ -6512,5 +6524,4 @@ def terminal_mode():
 # ============================================================
 
 if __name__ == "__main__":
-
     terminal_mode()
