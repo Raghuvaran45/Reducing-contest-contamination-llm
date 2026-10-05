@@ -1,6 +1,4 @@
-Absolutely buddy. Here is a **humanized, professional README.md** that you can directly put into your GitHub repository. It explains the project from the beginning without sounding overly AI-generated.
 
-```markdown
 # Reducing Context Contamination in LLMs
 
 ## 📌 Project Overview
@@ -526,8 +524,3 @@ The main idea behind the project is:
 > **Better context can lead to better answers.**
 
 Instead of simply giving an LLM more information, this project focuses on giving it the **right information at the right time**.
-```
-
-### Small recommendation
-
-For GitHub, I would use this as your `README.md`. It is written in a **student/project-report style**, rather than making it sound like a marketing page or something generated entirely by AI.
